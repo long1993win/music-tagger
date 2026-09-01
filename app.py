@@ -11,12 +11,12 @@ from tkinter import ttk, filedialog, messagebox
 
 from core import (
     scan_folder, identify, resolve_cover, write_tags,
-    AUDIO_EXTS, fetch_cover,
+    fetch_lyrics, AUDIO_EXTS, fetch_cover,
 )
 
 APP_TITLE = "🎵 MusicTagger — 音乐自动补全"
-COLS = ["#", "文件名", "标题", "艺术家", "专辑", "封面", "来源", "分数"]
-COL_WIDTHS = [40, 200, 180, 150, 150, 90, 80, 60]
+COLS = ["#", "文件名", "标题", "艺术家", "专辑", "封面", "歌词", "来源", "分数"]
+COL_WIDTHS = [35, 180, 160, 130, 130, 70, 70, 70, 50]
 
 
 class MusicTaggerApp:
@@ -59,8 +59,10 @@ class MusicTaggerApp:
         self.opt_artist = tk.BooleanVar(value=True)
         self.opt_album = tk.BooleanVar(value=True)
         self.opt_cover = tk.BooleanVar(value=True)
+        self.opt_lyrics = tk.BooleanVar(value=True)
         for txt, var in [("补全标题", self.opt_title), ("补全艺术家", self.opt_artist),
-                         ("补全专辑", self.opt_album), ("下载封面", self.opt_cover)]:
+                         ("补全专辑", self.opt_album), ("下载封面", self.opt_cover),
+                         ("下载歌词", self.opt_lyrics)]:
             ttk.Checkbutton(opt, text=txt, variable=var).pack(side="left", padx=6)
 
         # 文件列表
@@ -110,9 +112,16 @@ class MusicTaggerApp:
                     cover_txt = "✗ 无图"
                 else:
                     cover_txt = "—"
+                lyrics = r.get("lyrics", "")
+                if lyrics:
+                    lyrics_txt = f"✓ {len(lyrics)}字"
+                elif r.get("lyrics_fail"):
+                    lyrics_txt = "✗ 无词"
+                else:
+                    lyrics_txt = "—"
                 vals = (i + 1, os.path.basename(fp), b.get("title", ""),
                         b.get("artist", ""), b.get("album", ""), cover_txt,
-                        b.get("source", ""), f"{b.get('score', 0):.1f}")
+                        lyrics_txt, b.get("source", ""), f"{b.get('score', 0):.1f}")
             else:
                 vals = (i + 1, os.path.basename(fp), "", "", "", "", "", "")
             self.tree.insert("", "end", iid=str(i), values=vals)
@@ -140,12 +149,20 @@ class MusicTaggerApp:
                     cover = resolve_cover(best, res.get("candidates", []))
                     if not cover:
                         cover_fail = True
+                lyrics = ""
+                lyrics_fail = False
+                if best and self.opt_lyrics.get():
+                    lyrics = fetch_lyrics(best.get("artist"), best.get("title"))
+                    if not lyrics:
+                        lyrics_fail = True
                 self.results[fp] = {
                     "parsed": res["parsed"],
                     "best": best,
                     "candidates": res.get("candidates", []),
                     "cover": cover,
                     "cover_fail": cover_fail,
+                    "lyrics": lyrics,
+                    "lyrics_fail": lyrics_fail,
                 }
             except Exception as e:
                 self.results[fp] = {"parsed": None, "best": None, "candidates": [], "cover": b"", "error": str(e)}
@@ -176,6 +193,7 @@ class MusicTaggerApp:
         def _do():
             ok = 0
             cover_ok = 0
+            lyrics_ok = 0
             skipped = 0
             for fp in files:
                 r = self.results.get(fp)
@@ -194,20 +212,23 @@ class MusicTaggerApp:
                 if r.get("parsed"):
                     meta["track"] = r["parsed"].get("track")
                 cover = r.get("cover", b"") if self.opt_cover.get() else b""
+                lyrics = r.get("lyrics", "") if self.opt_lyrics.get() else ""
                 try:
-                    write_tags(fp, meta, cover)
+                    write_tags(fp, meta, cover, lyrics)
                     ok += 1
                     if cover:
                         cover_ok += 1
+                    if lyrics:
+                        lyrics_ok += 1
                 except Exception as e:
                     print(f"写入失败 {fp}: {e}")
                     self._set_status(f"写入失败: {os.path.basename(fp)} ({e})")
             if skipped:
-                self._set_status(f"完成: {ok}/{len(files)} 写入 ({skipped} 未识别跳过), 封面 {cover_ok} 个")
+                self._set_status(f"完成: {ok}/{len(files)} 写入 ({skipped} 跳过), 封面 {cover_ok}, 歌词 {lyrics_ok}")
             else:
-                self._set_status(f"完成: {ok}/{len(files)} 写入, 封面 {cover_ok} 个")
+                self._set_status(f"完成: {ok}/{len(files)} 写入, 封面 {cover_ok}, 歌词 {lyrics_ok}")
             self.root.after(0, lambda: messagebox.showinfo(
-                "完成", f"成功写入 {ok}/{len(files)} 个文件\n封面写入 {cover_ok} 个"))
+                "完成", f"成功写入 {ok}/{len(files)} 个文件\n封面 {cover_ok} 个, 歌词 {lyrics_ok} 个"))
 
         threading.Thread(target=_do, daemon=True).start()
 
