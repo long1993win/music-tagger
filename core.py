@@ -17,6 +17,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, TPE2, TRCK, APIC, USLT
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggvorbis import OggVorbis
+from mutagen.wave import WAVE
 
 try:
     from PIL import Image
@@ -299,7 +300,7 @@ def resolve_cover(best, candidates=None) -> bytes:
 
 
 # ---------------------------------------------------------------- 歌词
-LYRIC_LANG = "zh"  # USLT 语言字段
+LYRIC_LANG = "chi"  # USLT 语言字段 (3位 ISO 639-2)
 
 def fetch_lyrics(artist=None, title=None, album=None) -> str:
     """从 lrclib.net 获取歌词。优先带时间戳的 LRC，否则纯文本。"""
@@ -440,6 +441,45 @@ def write_tags(path: str, meta: dict, cover: bytes = b"", lyrics: str = "") -> b
             audio["metadata_block_picture"] = [pic.write().decode("ascii")]
         if lyrics:
             audio["lyrics"] = lyrics
+        audio.save()
+
+    elif ext == ".wav":
+        # WAV 通过 ID3v2 标签内嵌封面/歌词（多数播放器认）
+        try:
+            audio = WAVE(path)
+            audio.add_tags()
+        except Exception:
+            audio = WAVE()
+            audio.add_tags()
+        tags = audio.tags
+        if tags is None:
+            audio.add_tags()
+            tags = audio.tags
+        if meta.get("title"):
+            tags.add(TIT2(encoding=3, text=meta["title"]))
+        if meta.get("artist"):
+            tags.add(TPE1(encoding=3, text=meta["artist"]))
+        if meta.get("album"):
+            tags.add(TALB(encoding=3, text=meta["album"]))
+        if meta.get("album_artist"):
+            tags.add(TPE2(encoding=3, text=meta["album_artist"]))
+        if meta.get("track"):
+            tags.add(TRCK(encoding=3, text=str(meta["track"])))
+        if cover:
+            for k in list(tags.keys()):
+                if k.startswith("APIC"):
+                    del tags[k]
+            tags.add(APIC(encoding=3, mime="image/jpeg", type=3,
+                          desc="Cover", data=cover))
+        if lyrics:
+            for k in list(tags.keys()):
+                if k.startswith("USLT"):
+                    del tags[k]
+            tags.add(USLT(encoding=3, lang=LYRIC_LANG, desc="", text=lyrics))
+        try:
+            audio.update_to_v24 = False
+        except Exception:
+            pass
         audio.save()
 
     else:
