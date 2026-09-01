@@ -16,7 +16,7 @@ from core import (
 
 APP_TITLE = "🎵 MusicTagger — 音乐自动补全"
 COLS = ["#", "文件名", "标题", "艺术家", "专辑", "封面", "来源", "分数"]
-COL_WIDTHS = [40, 200, 180, 150, 150, 50, 80, 60]
+COL_WIDTHS = [40, 200, 180, 150, 150, 90, 80, 60]
 
 
 class MusicTaggerApp:
@@ -103,9 +103,15 @@ class MusicTaggerApp:
             r = self.results.get(fp)
             if r and r.get("best"):
                 b = r["best"]
-                cover = "✓" if r.get("cover") else "—"
+                cover = r.get("cover", b"")
+                if cover:
+                    cover_txt = f"✓ {len(cover) // 1024}KB"
+                elif r.get("cover_fail"):
+                    cover_txt = "✗ 无图"
+                else:
+                    cover_txt = "—"
                 vals = (i + 1, os.path.basename(fp), b.get("title", ""),
-                        b.get("artist", ""), b.get("album", ""), cover,
+                        b.get("artist", ""), b.get("album", ""), cover_txt,
                         b.get("source", ""), f"{b.get('score', 0):.1f}")
             else:
                 vals = (i + 1, os.path.basename(fp), "", "", "", "", "", "")
@@ -129,13 +135,17 @@ class MusicTaggerApp:
                 res = identify(fp)
                 best = res.get("best")
                 cover = b""
+                cover_fail = False
                 if best and self.opt_cover.get():
                     cover = resolve_cover(best, res.get("candidates", []))
+                    if not cover:
+                        cover_fail = True
                 self.results[fp] = {
                     "parsed": res["parsed"],
                     "best": best,
                     "candidates": res.get("candidates", []),
                     "cover": cover,
+                    "cover_fail": cover_fail,
                 }
             except Exception as e:
                 self.results[fp] = {"parsed": None, "best": None, "candidates": [], "cover": b"", "error": str(e)}
@@ -165,9 +175,12 @@ class MusicTaggerApp:
     def _write_files(self, files):
         def _do():
             ok = 0
+            cover_ok = 0
+            skipped = 0
             for fp in files:
                 r = self.results.get(fp)
                 if not r or not r.get("best"):
+                    skipped += 1
                     continue
                 b = r["best"]
                 meta = {}
@@ -184,10 +197,17 @@ class MusicTaggerApp:
                 try:
                     write_tags(fp, meta, cover)
                     ok += 1
+                    if cover:
+                        cover_ok += 1
                 except Exception as e:
                     print(f"写入失败 {fp}: {e}")
-            self._set_status(f"写入完成: {ok}/{len(files)}")
-            self.root.after(0, lambda: messagebox.showinfo("完成", f"成功写入 {ok}/{len(files)} 个文件"))
+                    self._set_status(f"写入失败: {os.path.basename(fp)} ({e})")
+            if skipped:
+                self._set_status(f"完成: {ok}/{len(files)} 写入 ({skipped} 未识别跳过), 封面 {cover_ok} 个")
+            else:
+                self._set_status(f"完成: {ok}/{len(files)} 写入, 封面 {cover_ok} 个")
+            self.root.after(0, lambda: messagebox.showinfo(
+                "完成", f"成功写入 {ok}/{len(files)} 个文件\n封面写入 {cover_ok} 个"))
 
         threading.Thread(target=_do, daemon=True).start()
 
