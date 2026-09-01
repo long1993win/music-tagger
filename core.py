@@ -341,6 +341,11 @@ def write_tags(path: str, meta: dict, cover: bytes = b"") -> bool:
                     del audio[k]
             audio.add(APIC(encoding=3, mime="image/jpeg", type=3,
                            desc="Cover", data=cover))
+        # 强制 v2.3，兼容 Windows 资源管理器 / WMP / 老播放器
+        try:
+            audio.update_to_v24 = False
+        except Exception:
+            pass
         audio.save(path)
 
     elif ext == ".flac":
@@ -404,7 +409,14 @@ def write_tags(path: str, meta: dict, cover: bytes = b"") -> bool:
         audio.save()
 
     else:
-        # 其他格式(WAV/APE/WMA…)不做内嵌，仅返回 True
+        # WAV/APE/WMA 等不支持内嵌封面 → 旁挂 folder.jpg（多数播放器认这个）
+        if cover:
+            try:
+                folder = os.path.dirname(path)
+                with open(os.path.join(folder, "folder.jpg"), "wb") as f:
+                    f.write(cover)
+            except Exception:
+                pass
         return True
 
     return True
