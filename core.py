@@ -13,7 +13,7 @@ import urllib.parse
 
 import requests
 from mutagen import File as MFile
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, TPE2, TRCK, APIC
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TPE2, TRCK, APIC, USLT
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggvorbis import OggVorbis
@@ -298,8 +298,31 @@ def resolve_cover(best, candidates=None) -> bytes:
     return b""
 
 
+# ---------------------------------------------------------------- 歌词
+LYRIC_LANG = "zh"  # USLT 语言字段
+
+def fetch_lyrics(artist=None, title=None, album=None) -> str:
+    """从 lrclib.net 获取歌词。优先带时间戳的 LRC，否则纯文本。"""
+    params = {}
+    if artist:
+        params["artist_name"] = clean_artist(artist)
+    if title:
+        params["track_name"] = title
+    if not params:
+        return ""
+    try:
+        url = "https://lrclib.net/api/get?" + urllib.parse.urlencode(params)
+        r = requests.get(url, timeout=15, headers=UA)
+        if r.status_code != 200:
+            return ""
+        d = r.json()
+        return (d.get("syncedLyrics") or d.get("plainLyrics") or "")
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------- 写标签
-def write_tags(path: str, meta: dict, cover: bytes = b"") -> bool:
+def write_tags(path: str, meta: dict, cover: bytes = b"", lyrics: str = "") -> bool:
     """
     meta: {title, artist, album, album_artist, track}
     返回 True 表示成功（无覆盖则返回 True 表示不需要处理）。
@@ -341,6 +364,11 @@ def write_tags(path: str, meta: dict, cover: bytes = b"") -> bool:
                     del audio[k]
             audio.add(APIC(encoding=3, mime="image/jpeg", type=3,
                            desc="Cover", data=cover))
+        if lyrics:
+            for k in list(audio.keys()):
+                if k.startswith("USLT"):
+                    del audio[k]
+            audio.add(USLT(encoding=3, lang=LYRIC_LANG, desc="", text=lyrics))
         # 强制 v2.3，兼容 Windows 资源管理器 / WMP / 老播放器
         try:
             audio.update_to_v24 = False
@@ -367,6 +395,8 @@ def write_tags(path: str, meta: dict, cover: bytes = b"") -> bool:
             pic.mime = "image/jpeg"
             pic.data = cover
             audio.add_picture(pic)
+        if lyrics:
+            audio["lyrics"] = lyrics
         audio.save()
 
     elif ext in (".m4a", ".mp4"):
@@ -386,6 +416,8 @@ def write_tags(path: str, meta: dict, cover: bytes = b"") -> bool:
                 pass
         if cover:
             audio["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
+        if lyrics:
+            audio["\xa9lyr"] = lyrics
         audio.save()
 
     elif ext in (".ogg", ".opus"):
@@ -406,6 +438,8 @@ def write_tags(path: str, meta: dict, cover: bytes = b"") -> bool:
             pic.mime = "image/jpeg"
             pic.data = cover
             audio["metadata_block_picture"] = [pic.write().decode("ascii")]
+        if lyrics:
+            audio["lyrics"] = lyrics
         audio.save()
 
     else:
@@ -463,10 +497,14 @@ if __name__ == "__main__":
         if args.cover or args.write:
             cover = resolve_cover(best, res["candidates"])
             print(f"  封面: {'✓ ' + str(len(cover)) + 'B' if cover else '✗ 未找到'}")
+        lyrics = ""
+        if args.write:
+            lyrics = fetch_lyrics(best.get("artist"), best.get("title"))
+            print(f"  歌词: {'✓ ' + str(len(lyrics)) + '字符' if lyrics else '✗ 未找到'}")
         if args.write:
             ok = write_tags(fp, {
                 "title": best["title"], "artist": best["artist"],
                 "album": best["album"], "album_artist": best.get("album_artist"),
                 "track": res["parsed"]["track"],
-            }, cover if args.cover else b"")
+            }, cover if args.cover else b"", lyrics)
             print(f"  写入: {'✓' if ok else '✗'}")
