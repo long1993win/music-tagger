@@ -213,19 +213,137 @@ def build_candidates(artist, title, album=None):
 
 
 def read_existing_tags(path: str) -> dict:
-    """尽量读出已有标签，作为搜索种子。"""
+    """读取文件现有完整标签（供扫描后展示原始信息）。"""
+    info = {
+        "title": None, "artist": None, "album": None, "album_artist": None,
+        "track": None, "lyrics": None, "has_cover": False, "has_lyrics": False,
+        "duration": None, "format": os.path.splitext(path)[1].lstrip(".").lower(),
+        "size": os.path.getsize(path) if os.path.exists(path) else 0,
+    }
+    ext = info["format"]
+
+    audio = None
     try:
-        f = MFile(path, easy=False)
+        if ext == "mp3":
+            audio = ID3(path)
+        elif ext == "flac":
+            audio = FLAC(path)
+        elif ext in ("m4a", "mp4"):
+            audio = MP4(path)
+        elif ext in ("ogg", "opus"):
+            audio = OggVorbis(path)
+        elif ext == "wav":
+            audio = getattr(WAVE(path), "tags", None)
+        else:
+            mf = MFile(path, easy=False)
+            audio = getattr(mf, "tags", None) if mf is not None else None
     except Exception:
-        return {}
-    if f is None:
-        return {}
-    out = {}
+        audio = None
+
+    if audio is None:
+        return info
+
+    def _v(group, key):
+        """从 dict-like 标签取值，兼容 str/list。"""
+        try:
+            v = group.get(key)
+        except Exception:
+            return None
+        if isinstance(v, (list, tuple)):
+            return str(v[0]) if v else None
+        return str(v) if v else None
+
     try:
-        out["title"] = f.get("TIT2", f.get("\xa9nam", [None]))[0] if hasattr(f, "get") else None
+        # 时长
+        fbody = MFile(path, easy=False)
+        if fbody is not None and fbody.info is not None:
+            info["duration"] = round(float(fbody.info.length), 1)
     except Exception:
         pass
-    return out
+
+    try:
+        if ext in ("flac", "ogg", "opus"):
+            info["title"] = _v(audio, "title")
+            info["artist"] = _v(audio, "artist")
+            info["album"] = _v(audio, "album")
+            info["album_artist"] = _v(audio, "albumartist") or _v(audio, "album artist")
+            tn = _v(audio, "tracknumber")
+            info["track"] = tn.split("/")[0] if tn else None
+            info["lyrics"] = _v(audio, "lyrics") or _v(audio, "unsyncedlyrics")
+            if ext == "flac":
+                info["has_cover"] = bool(getattr(audio, "pictures", None))
+            else:
+                info["has_cover"] = "metadata_block_picture" in audio
+        elif ext in ("m4a", "mp4"):
+            info["title"] = _v(audio, "\xa9nam")
+            info["artist"] = _v(audio, "\xa9ART")
+            info["album"] = _v(audio, "\xa9alb")
+            info["album_artist"] = _v(audio, "aART")
+            tr = audio.get("trkn")
+            if tr:
+                info["track"] = str(tr[0][0])
+            info["lyrics"] = _v(audio, "\xa9lyr")
+            info["has_cover"] = bool(audio.get("covr"))
+        elif ext in ("mp3", "wav") or (audio is not None and hasattr(audio, "getall")):
+            # ID3 帧（mp3 / wav 的 ID3v2）
+            for k in list(audio.keys()):
+                try:
+                    fr = audio[k]
+                    if k.startswith("TIT2") and not info["title"]:
+                        info["title"] = str(fr.text[0]) if getattr(fr, "text", None) else None
+                    elif k.startswith("TPE1") and not info["artist"]:
+                        info["artist"] = str(fr.text[0]) if getattr(fr, "text", None) else None
+                    elif k.startswith("TALB") and not info["album"]:
+                        info["album"] = str(fr.text[0]) if getattr(fr, "text", None) else None
+                    elif k.startswith("TPE2") and not info["album_artist"]:
+                        info["album_artist"] = str(fr.text[0]) if getattr(fr, "text", None) else None
+                    elif k.startswith("TRCK") and not info["track"]:
+                        info["track"] = str(fr.text[0]) if getattr(fr, "text", None) else None
+                    elif k.startswith("USLT") and not info["lyrics"]:
+                        info["lyrics"] = str(fr.text) if getattr(fr, "text", None) else None
+                    elif k.startswith("APIC"):
+                        info["has_cover"] = True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    info["has_lyrics"] = bool(info["lyrics"])
+    return info
+
+
+def read_cover(path: str) -> bytes:
+    """读取文件现有嵌入封面，返回 bytes（无则空）。"""
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    try:
+        if ext == "mp3":
+            a = ID3(path)
+            for k in a.keys():
+                if k.startswith("APIC"):
+                    return bytes(a[k].data)
+        elif ext == "flac":
+            a = FLAC(path)
+            if a.pictures:
+                return bytes(a.pictures[0].data)
+        elif ext in ("m4a", "mp4"):
+            a = MP4(path)
+            if a.get("covr"):
+                return bytes(a["covr"][0])
+        elif ext in ("ogg", "opus"):
+            a = OggVorbis(path)
+            if "metadata_block_picture" in a:
+                import base64
+                p = Picture(base64.b64decode(a["metadata_block_picture"][0]))
+                return bytes(p.data)
+        elif ext == "wav":
+            tags = getattr(WAVE(path), "tags", None)
+            if tags:
+                for k in tags.keys():
+                    if k.startswith("APIC"):
+                        return bytes(tags[k].data)
+    except Exception:
+        return b""
+    return b""
 
 
 def identify(path: str, prefer_existing=True) -> dict:
