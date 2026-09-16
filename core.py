@@ -627,11 +627,19 @@ def process_many(files, want_cover=True, want_lyrics=True, workers=4, progress=N
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_work, (i, fp)): i for i, fp in enumerate(files)}
         for fut in as_completed(futs):
-            i, fp, result = fut.result()
+            try:
+                i, fp, result = fut.result()
+            except Exception:
+                # 单个文件处理出错不中断整体
+                continue
             results[fp] = result
             done += 1
             if progress:
-                progress(done, n)
+                try:
+                    progress(done, n)
+                except Exception:
+                    # 进度回调出错（如 tkinter 线程问题）不影响结果收集
+                    pass
     # 保持顺序
     ordered = {fp: results[fp] for fp in files if fp in results}
     return ordered
