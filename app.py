@@ -11,12 +11,15 @@ from tkinter import ttk, filedialog, messagebox
 
 from core import (
     scan_folder, identify, resolve_cover, write_tags,
-    fetch_lyrics, AUDIO_EXTS, fetch_cover,
+    fetch_lyrics, process_many, AUDIO_EXTS, fetch_cover,
 )
 
 APP_TITLE = "🎵 MusicTagger — 音乐自动补全"
 COLS = ["#", "文件名", "标题", "艺术家", "专辑", "封面", "歌词", "来源", "分数"]
 COL_WIDTHS = [35, 180, 160, 130, 130, 70, 70, 70, 50]
+
+# 并发线程数（公开无 key API 限流较宽松，4-6 安全；过高易被限流）
+WORKERS = 4
 
 
 class MusicTaggerApp:
@@ -64,6 +67,11 @@ class MusicTaggerApp:
                          ("补全专辑", self.opt_album), ("下载封面", self.opt_cover),
                          ("下载歌词", self.opt_lyrics)]:
             ttk.Checkbutton(opt, text=txt, variable=var).pack(side="left", padx=6)
+
+        ttk.Label(opt, text="线程:").pack(side="left", padx=(16, 2))
+        self.worker_var = tk.IntVar(value=WORKERS)
+        ttk.Spinbox(opt, from_=1, to=12, width=4, textvariable=self.worker_var) \
+            .pack(side="left")
 
         # 文件列表
         mid = ttk.Frame(self.root, padding=(8, 4))
@@ -138,36 +146,30 @@ class MusicTaggerApp:
     def _identify_all(self):
         n = len(self.files)
         self.progress["maximum"] = n
-        for i, fp in enumerate(self.files):
-            self._set_status(f"识别中 ({i + 1}/{n}): {os.path.basename(fp)}")
-            try:
-                res = identify(fp)
-                best = res.get("best")
-                cover = b""
-                cover_fail = False
-                if best and self.opt_cover.get():
-                    cover = resolve_cover(best, res.get("candidates", []))
-                    if not cover:
-                        cover_fail = True
-                lyrics = ""
-                lyrics_fail = False
-                if best and self.opt_lyrics.get():
-                    lyrics = fetch_lyrics(best.get("artist"), best.get("title"))
-                    if not lyrics:
-                        lyrics_fail = True
-                self.results[fp] = {
-                    "parsed": res["parsed"],
-                    "best": best,
-                    "candidates": res.get("candidates", []),
-                    "cover": cover,
-                    "cover_fail": cover_fail,
-                    "lyrics": lyrics,
-                    "lyrics_fail": lyrics_fail,
-                }
-            except Exception as e:
-                self.results[fp] = {"parsed": None, "best": None, "candidates": [], "cover": b"", "error": str(e)}
-            self.progress["value"] = i + 1
+        want_cover = self.opt_cover.get()
+        want_lyrics = self.opt_lyrics.get()
+        workers = max(1, min(12, int(self.worker_var.get())))
+
+        def _progress(done, total):
+            self.progress["value"] = done
+            self._set_status(f"识别中 ({done}/{total}) — {workers} 线程并行")
             self.root.after(0, self._refresh_tree)
+
+        try:
+            results = process_many(
+                self.files,
+                want_cover=want_cover,
+                want_lyrics=want_lyrics,
+                workers=workers,
+                progress=_progress,
+            )
+        except Exception as e:
+            self._set_status(f"识别出错: {e}")
+            self.processing = False
+            return
+
+        self.results.update(results)
+        self.root.after(0, self._refresh_tree)
         self.processing = False
         ok = sum(1 for r in self.results.values() if r.get("best"))
         self._set_status(f"完成: {ok}/{n} 识别成功")
