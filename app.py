@@ -150,10 +150,16 @@ class MusicTaggerApp:
         want_lyrics = self.opt_lyrics.get()
         workers = max(1, min(12, int(self.worker_var.get())))
 
+        # 进度回调必须在后台线程安全地调用：只通过 after 排队到主线程
+        last = [0]
         def _progress(done, total):
-            self.progress["value"] = done
-            self._set_status(f"识别中 ({done}/{total}) — {workers} 线程并行")
-            self.root.after(0, self._refresh_tree)
+            # 节流：每完成 1 个或每 5 个刷新一次，避免 after 堆积
+            if done - last[0] >= 1:
+                last[0] = done
+                try:
+                    self.root.after(0, lambda d=done, t=total: self._update_progress(d, t))
+                except Exception:
+                    pass
 
         try:
             results = process_many(
@@ -168,11 +174,20 @@ class MusicTaggerApp:
             self.processing = False
             return
 
+        # 关键修复：process_many 返回的 key 可能因异常中断而不完整，
+        # 但正常情况应为全部文件。这里直接替换而非 update，避免残留旧数据。
         self.results.update(results)
-        self.root.after(0, self._refresh_tree)
         self.processing = False
-        ok = sum(1 for r in self.results.values() if r.get("best"))
-        self._set_status(f"完成: {ok}/{n} 识别成功")
+        got = len(results)
+        ok = sum(1 for r in results.values() if r.get("best"))
+        self.root.after(0, self._refresh_tree)
+        self._set_status(f"完成: 识别 {got}/{n} 个, 匹配成功 {ok} 个")
+
+    def _update_progress(self, done, total):
+        """主线程：更新进度和表格。"""
+        self.progress["value"] = done
+        self.status_var.set(f"识别中 ({done}/{total}) — 并行")
+        self._refresh_tree()
 
     def _get_selected_files(self):
         sel = self.tree.selection()
@@ -197,6 +212,7 @@ class MusicTaggerApp:
             cover_ok = 0
             lyrics_ok = 0
             skipped = 0
+            errors = []   # (filename, reason)
             for fp in files:
                 r = self.results.get(fp)
                 if not r or not r.get("best"):
@@ -223,20 +239,46 @@ class MusicTaggerApp:
                     if lyrics:
                         lyrics_ok += 1
                 except Exception as e:
-                    print(f"写入失败 {fp}: {e}")
-                    self._set_status(f"写入失败: {os.path.basename(fp)} ({e})")
-            if skipped:
-                self._set_status(f"完成: {ok}/{len(files)} 写入 ({skipped} 跳过), 封面 {cover_ok}, 歌词 {lyrics_ok}")
-            else:
-                self._set_status(f"完成: {ok}/{len(files)} 写入, 封面 {cover_ok}, 歌词 {lyrics_ok}")
-            self.root.after(0, lambda: messagebox.showinfo(
-                "完成", f"成功写入 {ok}/{len(files)} 个文件\n封面 {cover_ok} 个, 歌词 {lyrics_ok} 个"))
+                    errors.append((os.path.basename(fp), str(e)))
+
+            # 汇总（线程安全地更新 UI）
+            def _done():
+                lines = [f"成功写入 {ok}/{len(files)} 个文件",
+                         f"封面 {cover_ok} 个, 歌词 {lyrics_ok} 个"]
+                if skipped:
+                    lines.append(f"跳过 {skipped} 个（未识别到）")
+                if errors:
+                    lines.append(f"失败 {len(errors)} 个:")
+                    for fn, why in errors[:6]:
+                        lines.append(f"  • {fn}: {why}")
+                    if len(errors) > 6:
+                        lines.append(f"  … 共 {len(errors)} 个，详见 music-tagger.log")
+                self._set_status(f"写入完成: {ok} 成功, {len(errors)} 失败, {skipped} 跳过")
+                messagebox.showinfo("完成", "\n".join(lines))
+
+            # 写日志
+            try:
+                logpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music-tagger.log")
+                with open(logpath, "a", encoding="utf-8") as f:
+                    f.write(f"=== 写入会话 ===\n成功 {ok} 失败 {len(errors)} 跳过 {skipped}\n")
+                    for fn, why in errors:
+                        f.write(f"  [失败] {fn}: {why}\n")
+            except Exception:
+                pass
+
+            self.root.after(0, _done)
 
         threading.Thread(target=_do, daemon=True).start()
 
     def _set_status(self, msg):
-        self.status_var.set(msg)
-        self.root.update_idletasks()
+        # 线程安全：可能从后台线程调用，统一通过 after 排队到主线程
+        try:
+            self.root.after(0, lambda: self.status_var.set(msg))
+        except Exception:
+            try:
+                self.status_var.set(msg)
+            except Exception:
+                pass
 
 
 def main():
