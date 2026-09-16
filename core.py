@@ -27,6 +27,12 @@ except Exception:
 
 UA = {"User-Agent": "MusicTagger/1.0 (personal use)"}
 MB_HEADERS = {"User-Agent": "MusicTagger/1.0 (personal-use; contact: user@example.com)"}
+QQ_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+              "Referer": "https://y.qq.com/"}
+KG_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+# 中文优先：这些源返回中文歌手名，识别打分时给予中文源更高权重
+CN_SOURCES = {"QQ音乐", "酷狗", "网易云"}
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wma", ".aac", ".wav", ".ape", ".wv"}
 
@@ -77,7 +83,23 @@ def clean_title(s: str) -> str:
     if not s:
         return ""
     s = re.sub(r"^(official|lyrics|audio)\s*(\s-)?", "", s, flags=re.I)
+    s = s.strip()
+    # 去掉版本/场景后缀（Live、DJ版、Remix、演唱会、伴奏等），便于歌词/搜索匹配
+    s = re.sub(r"\s*[（\(\[][^）\)\]]*[）\)\]]\s*$", "", s)
+    s = re.sub(r"\s*[-~—]\s*(live|dj\s*版?|remix|concert|演唱会|伴奏|instrumental|acoustic|edit|extended|radio|cover|翻唱|现场|原版|完整版|纯音乐|ktv|消音|和声)\s*[版本]?\s*$", "", s, flags=re.I)
     return s.strip()
+
+
+def strip_version_suffix(s: str) -> str:
+    """专门去掉标题末尾的版本标签，返回更干净的标题（用于歌词搜索）。"""
+    if not s:
+        return ""
+    t = s.strip()
+    # 括号及其中内容（中文/英文括号）
+    t = re.sub(r"\s*[（\(\[【][^）\)\]】]*[）\)\]】]\s*$", "", t)
+    # 无括号的 - 后缀版本
+    t = re.sub(r"\s*[-~—]\s*(live|dj|remix|concert|演唱会|伴奏|instrumental|acoustic|edit|extended|radio|cover|翻唱|现场|版|完整版|纯音乐)\s*$", "", t, flags=re.I)
+    return t.strip()
 
 
 def norm(s) -> str:
@@ -133,6 +155,35 @@ def search_musicbrainz(artist=None, title=None, limit=8):
         return r.json().get("recordings", [])
     except Exception:
         return []
+
+
+def search_qqmusic(artist=None, title=None, limit=8):
+    """QQ音乐搜索：返回中文歌手名/中文标题/中文专辑/封面。"""
+    w = " ".join(x for x in (clean_artist(artist), title) if x).strip()
+    if not w:
+        return []
+    out = []
+    try:
+        r = requests.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+                         params={"w": w, "format": "json", "p": 1, "n": limit},
+                         timeout=15, headers=QQ_HEADERS)
+        r.raise_for_status()
+        songs = r.json().get("data", {}).get("song", {}).get("list", [])
+        for s in songs:
+            singers = [x.get("name", "") for x in (s.get("singer") or [])]
+            songmid = s.get("songmid")
+            albummid = (s.get("album") or {}).get("albummid")
+            out.append({
+                "title": s.get("songname"),
+                "artist": "、".join(singers),
+                "album": s.get("albumname") or None,
+                "mid": songmid,
+                "album_mid": albummid,
+                "cover_url": f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{albummid}.jpg" if albummid else None,
+            })
+    except Exception:
+        pass
+    return out
 
 
 def _cover_art_archive(mbid):
@@ -199,6 +250,18 @@ def build_candidates(artist, title, album=None):
             "score": 0,
         })
 
+    for qq in search_qqmusic(artist, title):
+        cands.append({
+            "source": "QQ音乐",
+            "title": qq["title"],
+            "artist": qq["artist"],
+            "album": qq["album"],
+            "album_artist": None,
+            "cover_url": qq["cover_url"],
+            "mbid": None,
+            "score": 0,
+        })
+
     # 打分：标题相似度最重要，其次艺术家、专辑
     for c in cands:
         s = sim(title, c["title"]) * 5
@@ -206,6 +269,9 @@ def build_candidates(artist, title, album=None):
             s += sim(clean_artist(artist), clean_artist(c["artist"] or "")) * 3
         if album:
             s += sim(album, c["album"] or "") * 2
+        # 中文源加权：中国歌手的歌，中文源(QQ音乐/酷狗)返回中文名，优先选
+        if c["source"] in CN_SOURCES:
+            s += 1.5
         c["score"] = round(s, 3)
 
     cands.sort(key=lambda x: x["score"], reverse=True)
@@ -492,8 +558,129 @@ def _fetch_lyrics_netease(artist=None, title=None) -> str:
         return ""
 
 
+def _fetch_lyrics_qqmusic(artist=None, title=None) -> str:
+    """渠道3: QQ音乐（中文曲目全、遮字快，返回明文 LRC）。"""
+    if not title:
+        return ""
+    try:
+        def _search(q):
+            r = requests.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+                             params={"w": q, "format": "json", "p": 1, "n": 6},
+                             timeout=15, headers=QQ_HEADERS)
+            r.raise_for_status()
+            return r.json().get("data", {}).get("song", {}).get("list", [])
+
+        songs = []
+        if artist:
+            songs = _search(f"{clean_artist(artist)} {title}")
+        if not songs:
+            songs = _search(title)
+        if not songs:
+            return ""
+
+        target = None
+        best_score = -1
+        for s in songs:
+            nm = s.get("songname") or ""
+            singers = "、".join(x.get("name", "") for x in (s.get("singer") or []))
+            sc = sim(title, nm) * 5
+            if artist:
+                ca = clean_artist(artist)
+                for sg in (s.get("singer") or []):
+                    a = sg.get("name", "")
+                    if ca and (ca in a or a in ca):
+                        sc += 3
+                        break
+            if sc > best_score:
+                best_score = sc
+                target = s
+
+        if not target or best_score < 4.0:
+            return ""
+
+        songmid = target.get("songmid")
+        r2 = requests.get("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
+                          params={"songmid": songmid, "format": "json", "nobase64": 1, "g_tk": 5381},
+                          timeout=15, headers=QQ_HEADERS)
+        r2.raise_for_status()
+        d = r2.json()
+        lyric = d.get("lyric") or ""
+        return lyric.strip()
+    except Exception:
+        return ""
+
+
+def _fetch_lyrics_kugou(artist=None, title=None) -> str:
+    """渠道4: 酷狗音乐（中文曲目兜底）。"""
+    if not title:
+        return ""
+    try:
+        def _search(q):
+            r = requests.get("http://mobilecdn.kugou.com/api/v3/search/song",
+                             params={"format": "json", "keyword": q, "page": 1, "pagesize": 6},
+                             timeout=15, headers=KG_HEADERS)
+            r.raise_for_status()
+            return r.json().get("data", {}).get("info", [])
+
+        songs = []
+        if artist:
+            songs = _search(f"{clean_artist(artist)} {title}")
+        if not songs:
+            songs = _search(title)
+        if not songs:
+            return ""
+
+        target = None
+        best_score = -1
+        for s in songs:
+            nm = s.get("songname") or ""
+            sn = s.get("singername") or ""
+            sc = sim(title, nm) * 5
+            if artist:
+                ca = clean_artist(artist)
+                if ca and (ca in sn or sn.replace("、", " ") in ca or ca.replace(" ", "") in sn.replace("、", "")):
+                    sc += 3
+            if sc > best_score:
+                best_score = sc
+                target = s
+
+        if not target or best_score < 4.0:
+            return ""
+
+        h = target.get("hash")
+        songname = target.get("songname") or title
+        # 搜歌词 id + accesskey
+        r2 = requests.get("http://lyrics.kugou.com/search",
+                          params={"ver": 1, "man": "yes", "client": "pc", "keyword": songname, "hash": h},
+                          timeout=15, headers=KG_HEADERS)
+        r2.raise_for_status()
+        cands = r2.json().get("candidates", [])
+        if not cands:
+            return ""
+        cid = cands[0].get("id")
+        accesskey = cands[0].get("accesskey")
+        # 下载歌词
+        r3 = requests.get("http://lyrics.kugou.com/download",
+                          params={"ver": 1, "client": "pc", "id": cid, "accesskey": accesskey,
+                                  "fmt": "lrc", "charset": "utf8"},
+                          timeout=15, headers=KG_HEADERS)
+        r3.raise_for_status()
+        content = (r3.json() or {}).get("content", "")
+        if not content:
+            return ""
+        if not content.lstrip().startswith("["):
+            import base64 as _b64
+            try:
+                content = _b64.b64decode(content).decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
+        return content.strip()
+    except Exception:
+        return ""
+
+
 # 歌词渠道（按顺序尝试，前一渠道失败自动切换下一个）
-LYRIC_CHANNELS = [_fetch_lyrics_lrclib, _fetch_lyrics_netease]
+LYRIC_CHANNELS = [_fetch_lyrics_lrclib, _fetch_lyrics_netease, _fetch_lyrics_qqmusic, _fetch_lyrics_kugou]
 
 
 def fetch_lyrics(artist=None, title=None, album=None) -> str:
@@ -706,7 +893,7 @@ def process_one(fp: str, want_cover: bool = True, want_lyrics: bool = True) -> d
         if not cover:
             cover_fail = True
     if best and want_lyrics:
-        lyrics = fetch_lyrics(best.get("artist"), best.get("title"))
+        lyrics = _fetch_lyrics_smart(res, best)
         if not lyrics:
             lyrics_fail = True
 
@@ -719,6 +906,43 @@ def process_one(fp: str, want_cover: bool = True, want_lyrics: bool = True) -> d
         "lyrics": lyrics,
         "lyrics_fail": lyrics_fail,
     }
+
+
+def _fetch_lyrics_smart(res: dict, best: dict) -> str:
+    """
+    智能歌词查询：优先用文件名原始标题（清洗版本后缀后）查询，
+    识别结果标题兑底。多组候选提高命中率。
+    """
+    parsed = res.get("parsed") or {}
+    fname_title = parsed.get("title")
+    fname_artist = parsed.get("artist")
+    best_title = best.get("title")
+    best_artist = best.get("artist")
+
+    candidates = []
+    if fname_title:
+        t = strip_version_suffix(fname_title)
+        if t:
+            candidates.append((fname_artist, t))
+    if fname_title:
+        candidates.append((fname_artist, fname_title))
+    if best_title:
+        t = strip_version_suffix(best_title)
+        if t:
+            candidates.append((best_artist, t))
+    if best_title:
+        candidates.append((best_artist, best_title))
+
+    seen = set()
+    for artist, title in candidates:
+        key = (clean_artist(artist or ""), title or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        lyric = fetch_lyrics(artist, title)
+        if lyric:
+            return lyric
+    return ""
 
 
 def process_many(files, want_cover=True, want_lyrics=True, workers=4, progress=None):
@@ -794,7 +1018,7 @@ if __name__ == "__main__":
             print(f"  封面: {'✓ ' + str(len(cover)) + 'B' if cover else '✗ 未找到'}")
         lyrics = ""
         if args.write:
-            lyrics = fetch_lyrics(best.get("artist"), best.get("title"))
+            lyrics = _fetch_lyrics_smart(res, best)
             print(f"  歌词: {'✓ ' + str(len(lyrics)) + '字符' if lyrics else '✗ 未找到'}")
         if args.write:
             ok = write_tags(fp, {
