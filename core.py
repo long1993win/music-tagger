@@ -631,16 +631,14 @@ def write_tags(path: str, meta: dict, cover: bytes = b"", lyrics: str = "") -> b
 
     elif ext == ".wav":
         # WAV 通过 ID3v2 标签内嵌封面/歌词（多数播放器认）
-        try:
-            audio = WAVE(path)
-            audio.add_tags()
-        except Exception:
-            audio = WAVE()
-            audio.add_tags()
+        audio = WAVE(path)
         tags = audio.tags
         if tags is None:
+            # 文件尚无 ID3 标签，需要创建（add_tags 会绑定 filename）
             audio.add_tags()
             tags = audio.tags
+        if tags is None:
+            return False
         if meta.get("title"):
             tags.add(TIT2(encoding=3, text=meta["title"]))
         if meta.get("artist"):
@@ -666,7 +664,7 @@ def write_tags(path: str, meta: dict, cover: bytes = b"", lyrics: str = "") -> b
             audio.update_to_v24 = False
         except Exception:
             pass
-        audio.save()
+        audio.save(path)
 
     else:
         # WAV/APE/WMA 等不支持内嵌封面 → 旁挂 folder.jpg（多数播放器认这个）
