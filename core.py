@@ -301,9 +301,12 @@ def resolve_cover(best, candidates=None) -> bytes:
 
 # ---------------------------------------------------------------- 歌词
 LYRIC_LANG = "chi"  # USLT 语言字段 (3位 ISO 639-2)
+NETEASE_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+              "Referer": "https://music.163.com/"}
 
-def fetch_lyrics(artist=None, title=None, album=None) -> str:
-    """从 lrclib.net 获取歌词。优先带时间戳的 LRC，否则纯文本。"""
+
+def _fetch_lyrics_lrclib(artist=None, title=None) -> str:
+    """渠道1: lrclib.net（免费无key，LRC 质量高，国际曲目全）。"""
     params = {}
     if artist:
         params["artist_name"] = clean_artist(artist)
@@ -320,6 +323,71 @@ def fetch_lyrics(artist=None, title=None, album=None) -> str:
         return (d.get("syncedLyrics") or d.get("plainLyrics") or "")
     except Exception:
         return ""
+
+
+def _fetch_lyrics_netease(artist=None, title=None) -> str:
+    """渠道2: 网易云音乐（中文主流曲目全，弥补 lrclib 中文盲区）。"""
+    if not title:
+        return ""
+    try:
+        # 搜索：优先 artist+title，命中则取；否则纯 title
+        def _search(q):
+            r = requests.get("https://music.163.com/api/search/get/web",
+                             params={"s": q, "type": 1, "limit": 8}, timeout=15, headers=NETEASE_UA)
+            r.raise_for_status()
+            return r.json().get("result", {}).get("songs", [])
+
+        songs = []
+        if artist:
+            songs = _search(f"{clean_artist(artist)} {title}")
+        if not songs:
+            songs = _search(title)
+        if not songs:
+            return ""
+
+        # 选匹配度最高的：标题相似 + 艺术家包含
+        target = None
+        best_score = -1
+        for s in songs:
+            nm = s.get("name") or ""
+            artists = [a.get("name", "") for a in (s.get("artists") or [])]
+            sc = sim(title, nm) * 5
+            if artist:
+                if any(clean_artist(artist) and (clean_artist(artist) in a or a in clean_artist(artist))
+                       for a in artists):
+                    sc += 3
+            if sc > best_score:
+                best_score = sc
+                target = s
+
+        if not target or best_score < 4.0:
+            return ""
+
+        sid = target.get("id")
+        lr = requests.get("https://music.163.com/api/song/lyric",
+                           params={"id": sid, "lv": 1, "kv": 1, "tv": -1},
+                           timeout=15, headers=NETEASE_UA)
+        lr.raise_for_status()
+        lyric = (lr.json().get("lrc") or {}).get("lyric") or ""
+        return lyric.strip()
+    except Exception:
+        return ""
+
+
+# 歌词渠道（按顺序尝试，前一渠道失败自动切换下一个）
+LYRIC_CHANNELS = [_fetch_lyrics_lrclib, _fetch_lyrics_netease]
+
+
+def fetch_lyrics(artist=None, title=None, album=None) -> str:
+    """多渠道获取歌词，首选 lrclib，失败换网易云。返回 LRC 或纯文本。"""
+    for ch in LYRIC_CHANNELS:
+        try:
+            lyric = ch(artist, title)
+            if lyric:
+                return lyric
+        except Exception:
+            continue
+    return ""
 
 
 # ---------------------------------------------------------------- 写标签
@@ -504,6 +572,69 @@ def scan_folder(folder: str):
             if os.path.splitext(n)[1].lower() in AUDIO_EXTS:
                 files.append(os.path.join(root, n))
     return files
+
+
+def process_one(fp: str, want_cover: bool = True, want_lyrics: bool = True) -> dict:
+    """
+    单文件完整处理：识别 -> 封面 -> 歌词。返回结果 dict（供多线程/CLI 复用）。
+    """
+    res = identify(fp)
+    best = res.get("best")
+    cover = b""
+    cover_fail = False
+    lyrics = ""
+    lyrics_fail = False
+
+    if best and want_cover:
+        cover = resolve_cover(best, res.get("candidates", []))
+        if not cover:
+            cover_fail = True
+    if best and want_lyrics:
+        lyrics = fetch_lyrics(best.get("artist"), best.get("title"))
+        if not lyrics:
+            lyrics_fail = True
+
+    return {
+        "parsed": res["parsed"],
+        "best": best,
+        "candidates": res.get("candidates", []),
+        "cover": cover,
+        "cover_fail": cover_fail,
+        "lyrics": lyrics,
+        "lyrics_fail": lyrics_fail,
+    }
+
+
+def process_many(files, want_cover=True, want_lyrics=True, workers=4, progress=None):
+    """
+    多线程批量处理。workers 默认 4（各公开 API 无 key 限流较宽松，4-6 线程安全，
+    不易触发封禁；太高易被临时限流/429）。progress 为可选回调 progress(done, total)。
+    返回 {filepath: result}（保持输入顺序）。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = {}
+    n = len(files)
+    if n == 0:
+        return results
+    # 每个线程内部加微小抖动，避免瞬间打满某个源
+    import random as _random
+    def _work(item):
+        i, fp = item
+        time.sleep(_random.uniform(0, 0.15))
+        return i, fp, process_one(fp, want_cover, want_lyrics)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_work, (i, fp)): i for i, fp in enumerate(files)}
+        for fut in as_completed(futs):
+            i, fp, result = fut.result()
+            results[fp] = result
+            done += 1
+            if progress:
+                progress(done, n)
+    # 保持顺序
+    ordered = {fp: results[fp] for fp in files if fp in results}
+    return ordered
 
 
 # ---------------------------------------------------------------- CLI 测试入口
