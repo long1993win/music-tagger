@@ -15,6 +15,17 @@ from core import (
     AUDIO_EXTS, fetch_cover,
 )
 
+def _app_dir():
+    """程序目录：源码运行=脚本目录；PyInstaller 打包=exe 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _log_path():
+    return os.path.join(_app_dir(), "music-tagger.log")
+
+
 APP_TITLE = "🎵 MusicTagger — 音乐自动补全"
 COLS = ["#", "文件名", "标题", "艺术家", "专辑", "封面", "歌词", "来源", "分数"]
 COL_WIDTHS = [35, 180, 160, 130, 130, 70, 70, 70, 50]
@@ -286,23 +297,26 @@ class MusicTaggerApp:
                 if skipped:
                     lines.append(f"跳过 {skipped} 个（未识别到）")
                 if errors:
+                    lines.append("")
                     lines.append(f"失败 {len(errors)} 个:")
-                    for fn, why in errors[:6]:
+                    for fn, why in errors[:12]:
                         lines.append(f"  • {fn}: {why}")
-                    if len(errors) > 6:
-                        lines.append(f"  … 共 {len(errors)} 个，详见 music-tagger.log")
+                    if len(errors) > 12:
+                        lines.append(f"  … 共 {len(errors)} 个")
+                    lines.append("")
+                    lines.append(f"完整日志: {_log_path()}")
                 self._set_status(f"写入完成: {ok} 成功, {len(errors)} 失败, {skipped} 跳过")
                 messagebox.showinfo("完成", "\n".join(lines))
 
-            # 写日志
+            # 写日志（写到 exe 所在目录，打包后也能找到）
             try:
-                logpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music-tagger.log")
+                logpath = _log_path()
                 with open(logpath, "a", encoding="utf-8") as f:
                     f.write(f"=== 写入会话 ===\n成功 {ok} 失败 {len(errors)} 跳过 {skipped}\n")
                     for fn, why in errors:
                         f.write(f"  [失败] {fn}: {why}\n")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"写日志失败: {e}")
 
             self.root.after(0, _done)
 
