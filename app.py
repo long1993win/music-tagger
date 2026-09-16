@@ -11,7 +11,8 @@ from tkinter import ttk, filedialog, messagebox
 
 from core import (
     scan_folder, identify, resolve_cover, write_tags,
-    fetch_lyrics, process_many, AUDIO_EXTS, fetch_cover,
+    fetch_lyrics, process_many, read_existing_tags, read_cover,
+    AUDIO_EXTS, fetch_cover,
 )
 
 APP_TITLE = "🎵 MusicTagger — 音乐自动补全"
@@ -31,10 +32,18 @@ class MusicTaggerApp:
 
         # 状态
         self.files = []          # [filepath]
-        self.results = {}        # filepath -> {parsed, best, candidates, cover}
+        self.results = {}        # filepath -> {parsed, best, candidates, cover, lyrics}
+        self.originals = {}      # filepath -> 文件原有标签 (识别前)
         self.processing = False
 
         self._build_ui()
+
+        # 右键菜单
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="📄 查看详细信息", command=self.show_details)
+        self.menu.add_command(label="🎵 查看歌词", command=self.show_lyrics)
+        self.menu.add_command(label="🖼 查看封面", command=self.show_cover)
+        self.tree.bind("<Button-3>", self._on_right_click)
 
     # ---- UI ----
     def _build_ui(self):
@@ -104,35 +113,64 @@ class MusicTaggerApp:
         self.path_var.set(folder)
         self.files = scan_folder(folder)
         self.results.clear()
+        self.originals.clear()
         self._refresh_tree()
-        self._set_status(f"扫描到 {len(self.files)} 个音乐文件")
+        # 后台读取每个文件原有标签，随读随刷新
+        threading.Thread(target=self._load_originals, daemon=True).start()
+        self._set_status(f"扫描到 {len(self.files)} 个音乐文件，正在读取原有标签…")
+
+    def _load_originals(self):
+        n = len(self.files)
+        for i, fp in enumerate(self.files):
+            try:
+                self.originals[fp] = read_existing_tags(fp)
+            except Exception:
+                self.originals[fp] = {}
+            if i % 10 == 0 or i == n - 1:
+                self.root.after(0, self._refresh_tree)
+                self._set_status(f"读取原有标签 {i + 1}/{n}")
+        self.root.after(0, self._refresh_tree)
+        self._set_status(f"扫描+读取完成: {n} 个文件")
 
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         for i, fp in enumerate(self.files):
-            r = self.results.get(fp)
-            if r and r.get("best"):
-                b = r["best"]
-                cover = r.get("cover", b"")
-                if cover:
-                    cover_txt = f"✓ {len(cover) // 1024}KB"
-                elif r.get("cover_fail"):
-                    cover_txt = "✗ 无图"
-                else:
-                    cover_txt = "—"
-                lyrics = r.get("lyrics", "")
-                if lyrics:
-                    lyrics_txt = f"✓ {len(lyrics)}字"
-                elif r.get("lyrics_fail"):
-                    lyrics_txt = "✗ 无词"
-                else:
-                    lyrics_txt = "—"
-                vals = (i + 1, os.path.basename(fp), b.get("title", ""),
-                        b.get("artist", ""), b.get("album", ""), cover_txt,
-                        lyrics_txt, b.get("source", ""), f"{b.get('score', 0):.1f}")
-            else:
-                vals = (i + 1, os.path.basename(fp), "", "", "", "", "", "")
+            vals = self._row_values(i, fp)
             self.tree.insert("", "end", iid=str(i), values=vals)
+
+    def _row_values(self, i, fp):
+        """生成一行显示值：识别结果优先，否则显示文件原有标签。"""
+        r = self.results.get(fp)
+        b = r.get("best") if r else None
+        orig = self.originals.get(fp) or {}
+
+        if b:
+            cover = r.get("cover", b"")
+            if cover:
+                cover_txt = f"✓ {len(cover) // 1024}KB"
+            elif r.get("cover_fail"):
+                cover_txt = "✗ 无图"
+            else:
+                cover_txt = "—"
+            lyrics = r.get("lyrics", "")
+            if lyrics:
+                lyrics_txt = f"✓ {len(lyrics)}字"
+            elif r.get("lyrics_fail"):
+                lyrics_txt = "✗ 无词"
+            else:
+                lyrics_txt = "—"
+            source = b.get("source", "")
+            score = f"{b.get('score', 0):.1f}"
+            return (i + 1, os.path.basename(fp), b.get("title", ""),
+                    b.get("artist", ""), b.get("album", ""), cover_txt,
+                    lyrics_txt, source, score)
+
+        # 原始标签（识别前）
+        cover_txt = "✓ 有" if orig.get("has_cover") else "—"
+        lyrics_txt = "✓ 有" if orig.get("has_lyrics") else "—"
+        return (i + 1, os.path.basename(fp), orig.get("title") or "",
+                orig.get("artist") or "", orig.get("album") or "",
+                cover_txt, lyrics_txt, "", "")
 
     def start_identify(self):
         if not self.files:
@@ -279,6 +317,138 @@ class MusicTaggerApp:
                 self.status_var.set(msg)
             except Exception:
                 pass
+
+    # ---- 右键查看 ----
+    def _on_right_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def _selected_file(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        idx = int(sel[0])
+        if 0 <= idx < len(self.files):
+            return self.files[idx]
+        return None
+
+    def show_details(self):
+        fp = self._selected_file()
+        if not fp:
+            return
+        orig = self.originals.get(fp) or {}
+        r = self.results.get(fp)
+        b = r.get("best") if r else None
+
+        def fmt(x, none="—"):
+            return str(x) if x not in (None, "") else none
+
+        lines = []
+        lines.append(f"文件名: {os.path.basename(fp)}")
+        lines.append(f"完整路径: {fp}")
+        lines.append(f"格式: {fmt(orig.get('format'))}   文件大小: {fmt(_fmt_size(orig.get('size', 0)))}")
+        lines.append(f"时长: {fmt(orig.get('duration'), '—')} 秒")
+        lines.append("")
+        lines.append("【文件原有标签】")
+        lines.append(f"  标题: {fmt(orig.get('title'))}")
+        lines.append(f"  艺术家: {fmt(orig.get('artist'))}")
+        lines.append(f"  专辑: {fmt(orig.get('album'))}")
+        lines.append(f"  专辑艺术家: {fmt(orig.get('album_artist'))}")
+        lines.append(f"  音轨号: {fmt(orig.get('track'))}")
+        lines.append(f"  封面: {'有' if orig.get('has_cover') else '无'}")
+        lines.append(f"  歌词: {'有 (' + str(len(orig.get('lyrics', ''))) + '字)' if orig.get('has_lyrics') else '无'}")
+        lines.append("")
+        lines.append("【识别结果】")
+        if b:
+            lines.append(f"  标题: {fmt(b.get('title'))}")
+            lines.append(f"  艺术家: {fmt(b.get('artist'))}")
+            lines.append(f"  专辑: {fmt(b.get('album'))}")
+            lines.append(f"  来源: {fmt(b.get('source'))}   匹配分数: {b.get('score', 0):.1f}")
+            lines.append(f"  新封面: {'有 (' + str(len(r.get('cover', b'')) // 1024) + 'KB)' if r.get('cover') else '无'}")
+            lines.append(f"  新歌词: {'有 (' + str(len(r.get('lyrics', ''))) + '字)' if r.get('lyrics') else '无'}")
+        else:
+            lines.append("  尚未识别")
+
+        self._show_text_window(f"详细信息 - {os.path.basename(fp)}", "\n".join(lines))
+
+    def show_lyrics(self):
+        fp = self._selected_file()
+        if not fp:
+            return
+        # 优先识别后的新歌词，否则用原有歌词
+        r = self.results.get(fp)
+        lyric = (r or {}).get("lyrics", "") if r and r.get("lyrics") else ""
+        src = "识别结果"
+        if not lyric:
+            lyric = (self.originals.get(fp) or {}).get("lyrics", "")
+            src = "文件原有"
+        if not lyric:
+            messagebox.showinfo("歌词", "该文件没有歌词")
+            return
+        self._show_text_window(f"歌词 ({src}) - {os.path.basename(fp)}", lyric)
+
+    def show_cover(self):
+        fp = self._selected_file()
+        if not fp:
+            return
+        r = self.results.get(fp)
+        cover = (r or {}).get("cover", b"")
+        src = "新封面"
+        if not cover:
+            cover = read_cover(fp)
+            src = "原有封面"
+        if not cover:
+            messagebox.showinfo("封面", "该文件没有封面")
+            return
+        self._show_image_window(f"封面 ({src}) - {os.path.basename(fp)}", cover)
+
+    def _show_text_window(self, title, text):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("600x500")
+        t = tk.Text(win, wrap="word", font=("Consolas", 10))
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        sb = ttk.Scrollbar(win, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        t.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+    def _show_image_window(self, title, cover_bytes):
+        try:
+            from PIL import Image, ImageTk
+            import io as _io
+            im = Image.open(_io.BytesIO(cover_bytes))
+            im.thumbnail((500, 500))
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            win = tk.Toplevel(self.root)
+            win.title(title)
+            photo = ImageTk.PhotoImage(im)
+            lbl = tk.Label(win, image=photo)
+            lbl.image = photo
+            lbl.pack(padx=10, pady=10)
+        except Exception as e:
+            messagebox.showerror("封面", f"无法显示封面: {e}")
+
+
+def _fmt_size(n):
+    try:
+        n = int(n)
+    except Exception:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n}{unit}"
+        n //= 1024
+    return f"{n}TB"
 
 
 def main():
